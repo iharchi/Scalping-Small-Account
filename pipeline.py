@@ -7,6 +7,8 @@ Runs a continuous loop with a max cycle time of 1 second:
   3. Pattern detection (every cycle)
   4. Exit monitoring for open positions (every cycle)
   5. Risk-managed trade signals
+
+All data and orders flow through the Alpaca broker.
 """
 
 import datetime
@@ -16,7 +18,7 @@ import pandas as pd
 
 import config
 from checklist import run_checklist
-from scanner import scan_watchlist, get_stock_data, get_daily_data, print_scan_results
+from scanner import scan_watchlist, get_stock_data, get_daily_data, get_latest_price, print_scan_results
 from patterns import scan_all_patterns
 from risk_manager import RiskManager
 
@@ -24,8 +26,9 @@ from risk_manager import RiskManager
 class TradingPipeline:
     """Main pipeline that ties all components together."""
 
-    def __init__(self, account_size=None, auto_checklist=False):
-        self.risk_manager = RiskManager(account_size)
+    def __init__(self, broker, account_size=None, auto_checklist=False):
+        self.broker = broker
+        self.risk_manager = RiskManager(broker=broker, account_size=account_size)
         self.auto_checklist = auto_checklist
         self.trade_log = []
         self.checklist_passed = False
@@ -51,23 +54,23 @@ class TradingPipeline:
             return self._scan_results
 
         print(f"\n[SCAN] Refreshing watchlist ({len(watchlist)} symbols)...")
-        self._scan_results = scan_watchlist(watchlist)
+        self._scan_results = scan_watchlist(self.broker, watchlist)
         self._last_scan_time = now
         print_scan_results(self._scan_results)
 
-        # Pre-fetch daily and premarket data for passing stocks
+        # Pre-fetch daily data for passing stocks
         for stock in self._scan_results:
             sym = stock["symbol"]
             if sym not in self._daily_cache:
-                daily = get_daily_data(sym, period="5d")
+                daily = get_daily_data(self.broker, sym, limit=10)
                 prev_close = daily["Close"].iloc[-2] if daily is not None and len(daily) >= 2 else None
                 self._daily_cache[sym] = (daily, prev_close)
 
         return self._scan_results
 
     def _fetch_intraday(self, symbol):
-        """Fetch latest intraday data for a symbol."""
-        return get_stock_data(symbol, period="1d", interval=config.INTRADAY_INTERVAL)
+        """Fetch latest intraday bars for a symbol."""
+        return get_stock_data(self.broker, symbol, timeframe="1min", limit=100)
 
     def _split_premarket(self, symbol, intraday):
         """Split intraday data into pre-market and regular hours."""
@@ -86,8 +89,20 @@ class TradingPipeline:
         self._premarket_cache[symbol] = (premarket_df, premarket_high)
         return premarket_df, premarket_high
 
-    def _check_open_position(self, current_price):
-        """Check stop loss / profit target on an open position."""
+    def _check_open_position(self):
+        """
+        Check stop loss / profit target on an open position.
+
+        Uses Alpaca order status polling (broker handles OCO cancellation).
+        Falls back to quote-based price check if no broker orders.
+        """
+        pos = self.risk_manager.open_position
+        if pos is None:
+            return None
+
+        # Get current price for logging (and fallback exit check)
+        current_price = get_latest_price(self.broker, pos["symbol"])
+
         result = self.risk_manager.check_exit_conditions(current_price)
         if result is None:
             return None
@@ -118,11 +133,7 @@ class TradingPipeline:
 
         # If we have an open position, just monitor it
         if self.risk_manager.open_position is not None:
-            pos = self.risk_manager.open_position
-            intraday = self._fetch_intraday(pos["symbol"])
-            if intraday is not None and len(intraday) > 0:
-                current_price = intraday["Close"].iloc[-1]
-                self._check_open_position(current_price)
+            self._check_open_position()
             return signals_this_cycle
 
         # Check if we can still trade
@@ -181,7 +192,7 @@ class TradingPipeline:
                     f"\n  [SIGNAL] {best['symbol']} — {best['pattern']} | "
                     f"Entry ${entry:.2f} | Stop ${stop:.2f} | "
                     f"Target ${target:.2f} | {shares} shares | "
-                    f"Risk ${risk_dollars:.2f} → Reward ${reward_dollars:.2f} | "
+                    f"Risk ${risk_dollars:.2f} -> Reward ${reward_dollars:.2f} | "
                     f"Confidence {best['confidence']:.0%}"
                 )
 
@@ -191,12 +202,13 @@ class TradingPipeline:
 
     def run(self, watchlist):
         """
-        Run the pipeline as a one-shot execution (legacy mode).
+        Run the pipeline as a one-shot execution.
         """
         print("\n" + "=" * 60)
         print("  SMALL ACCOUNT SCALPING PIPELINE")
         print(f"  Account: ${self.risk_manager.account_size:,.2f}")
-        print(f"  Date: {datetime.date.today()}")
+        print(f"  Mode:    {'Paper' if config.ALPACA_PAPER else 'LIVE'}")
+        print(f"  Date:    {datetime.date.today()}")
         print("=" * 60)
 
         if not self.step_1_checklist():
@@ -245,7 +257,7 @@ class TradingPipeline:
         if opportunities:
             best = max(opportunities, key=lambda o: o["confidence"])
             print(f"\n  Top opportunity: {best['symbol']} — {best['pattern']}")
-            print(f"    Entry ${best['entry']:.2f} → Target ${best['profit_target']:.2f}")
+            print(f"    Entry ${best['entry']:.2f} -> Target ${best['profit_target']:.2f}")
         else:
             print("  No trade opportunities. Patience is key.")
 
@@ -256,7 +268,7 @@ class TradingPipeline:
         Run the pipeline in a continuous loop with cycles <= 1 second.
 
         Each cycle:
-          - Fetches latest data
+          - Polls Alpaca for latest quotes / order status
           - Detects patterns or monitors open position
           - Enforces risk limits
           - Sleeps for the remainder of the cycle interval
@@ -264,9 +276,15 @@ class TradingPipeline:
         print("\n" + "=" * 60)
         print("  SMALL ACCOUNT SCALPING PIPELINE — LIVE LOOP")
         print(f"  Account: ${self.risk_manager.account_size:,.2f}")
+        print(f"  Mode:    {'Paper' if config.ALPACA_PAPER else 'LIVE'}")
         print(f"  Cycle:   {config.CYCLE_INTERVAL}s max")
         print(f"  Date:    {datetime.date.today()}")
         print("=" * 60)
+
+        # Check market hours
+        if not self.broker.is_market_open():
+            print("\n[WARNING] Market is currently closed.")
+            print("  Orders will queue until market opens.")
 
         if not self.step_1_checklist():
             print("\n[PIPELINE STOPPED] Checklist failed. No trading today.")

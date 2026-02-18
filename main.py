@@ -3,11 +3,12 @@
 Small Account Scalping Pipeline — Entry Point.
 
 Usage:
-    python main.py                          # One-shot scan
-    python main.py --loop                   # Live loop (1s cycles)
     python main.py --loop --auto            # Live loop, skip checklist
+    python main.py                          # One-shot scan
     python main.py --symbols AAPL TSLA      # Custom watchlist
     python main.py --account-size 1000      # Custom account size
+
+Requires ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables.
 
 Disclaimer: Trading is risky. Most traders lose money.
 This tool is for educational purposes only.
@@ -16,6 +17,7 @@ This tool is for educational purposes only.
 import argparse
 import sys
 
+from broker import AlpacaBroker
 from pipeline import TradingPipeline
 
 
@@ -41,7 +43,7 @@ def parse_args():
         "--account-size",
         type=float,
         default=None,
-        help="Starting account size in dollars (default: from config)",
+        help="Starting account size in dollars (default: synced from Alpaca)",
     )
     parser.add_argument(
         "--auto",
@@ -71,7 +73,23 @@ def main():
     print("  Read the full disclaimer before trading real money.")
     print("*" * 60)
 
+    # Initialize Alpaca broker
+    try:
+        broker = AlpacaBroker()
+    except ValueError as e:
+        print(f"\n[ERROR] {e}")
+        print("  Export your keys:")
+        print("    export ALPACA_API_KEY='your-key'")
+        print("    export ALPACA_SECRET_KEY='your-secret'")
+        return 1
+
+    acct = broker.get_account()
+    import config as cfg
+    print(f"\n  Connected to Alpaca ({'Paper' if cfg.ALPACA_PAPER else 'LIVE'})")
+    print(f"  Equity: ${acct['equity']:,.2f}  |  Buying Power: ${acct['buying_power']:,.2f}")
+
     pipeline = TradingPipeline(
+        broker=broker,
         account_size=args.account_size,
         auto_checklist=args.auto,
     )

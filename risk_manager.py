@@ -6,6 +6,8 @@ Enforces strict risk management rules:
   - Max daily loss limit
   - Position sizing based on stop distance
   - Trade count limits
+
+Integrates with Alpaca for live order placement and monitoring.
 """
 
 import config
@@ -14,12 +16,19 @@ import config
 class RiskManager:
     """Manages risk for a small trading account."""
 
-    def __init__(self, account_size=None):
-        self.account_size = account_size or config.ACCOUNT_SIZE
+    def __init__(self, broker=None, account_size=None):
+        self.broker = broker
         self.daily_pnl = 0.0
         self.trades_today = 0
         self.max_trades = config.MAX_TRADES_PER_DAY
         self.open_position = None
+
+        # Sync account size from broker if available, else use config
+        if broker:
+            acct = broker.get_account()
+            self.account_size = account_size or acct["equity"]
+        else:
+            self.account_size = account_size or config.ACCOUNT_SIZE
 
     @property
     def max_risk_per_trade(self):
@@ -30,6 +39,12 @@ class RiskManager:
     def max_daily_loss(self):
         """Maximum daily loss in dollars."""
         return self.account_size * (config.MAX_LOSS_PER_DAY_PCT / 100)
+
+    def sync_account(self):
+        """Sync account size from broker."""
+        if self.broker:
+            acct = self.broker.get_account()
+            self.account_size = acct["equity"]
 
     def can_trade(self):
         """Check if we are allowed to take another trade."""
@@ -82,17 +97,95 @@ class RiskManager:
         return target
 
     def open_trade(self, symbol, entry_price, stop_loss_price, shares):
-        """Record a new open position."""
+        """
+        Open a trade — places a market buy via Alpaca, then submits
+        a stop-limit sell (stop loss) and a limit sell (profit target).
+        """
+        target = self.calculate_profit_target(entry_price, stop_loss_price)
+
         self.open_position = {
             "symbol": symbol,
             "entry_price": entry_price,
             "stop_loss": stop_loss_price,
-            "profit_target": self.calculate_profit_target(entry_price, stop_loss_price),
+            "profit_target": target,
             "shares": shares,
             "risk": abs(entry_price - stop_loss_price) * shares,
+            "buy_order_id": None,
+            "stop_order_id": None,
+            "target_order_id": None,
         }
+
+        if self.broker:
+            # Place market buy
+            buy_order = self.broker.buy_market(symbol, shares)
+            self.open_position["buy_order_id"] = buy_order["id"]
+
+            if buy_order["filled_avg_price"]:
+                self.open_position["entry_price"] = buy_order["filled_avg_price"]
+
+            print(f"  [ORDER] BUY {shares} {symbol} @ market → {buy_order['status']}")
+
+            # Place stop loss (stop-limit with 1% slippage buffer)
+            stop_limit = round(stop_loss_price * 0.99, 2)
+            stop_order = self.broker.sell_stop_limit(symbol, shares, stop_loss_price, stop_limit)
+            self.open_position["stop_order_id"] = stop_order["id"]
+            print(f"  [ORDER] STOP {shares} {symbol} trigger ${stop_loss_price:.2f} limit ${stop_limit:.2f} → {stop_order['status']}")
+
+            # Place profit target
+            target_order = self.broker.sell_limit(symbol, shares, target)
+            self.open_position["target_order_id"] = target_order["id"]
+            print(f"  [ORDER] TARGET {shares} {symbol} limit ${target:.2f} → {target_order['status']}")
+
         self.trades_today += 1
         return self.open_position
+
+    def check_exit_conditions(self, current_price):
+        """
+        Check if an exit has been triggered.
+
+        With Alpaca: polls order statuses to see if stop or target filled.
+        Without broker: falls back to price comparison.
+        """
+        if self.open_position is None:
+            return None
+
+        if self.broker:
+            return self._check_order_fills()
+
+        # Fallback: manual price check
+        if current_price <= self.open_position["stop_loss"]:
+            return "stop_loss", self.open_position["stop_loss"]
+
+        if current_price >= self.open_position["profit_target"]:
+            return "profit_target", self.open_position["profit_target"]
+
+        return None
+
+    def _check_order_fills(self):
+        """Check if the stop or target order has been filled on Alpaca."""
+        pos = self.open_position
+
+        # Check stop loss order
+        if pos["stop_order_id"]:
+            stop_info = self.broker.get_order(pos["stop_order_id"])
+            if stop_info["status"] == "filled":
+                fill_price = stop_info["filled_avg_price"] or pos["stop_loss"]
+                # Cancel the target order
+                if pos["target_order_id"]:
+                    self.broker.cancel_order(pos["target_order_id"])
+                return "stop_loss", fill_price
+
+        # Check profit target order
+        if pos["target_order_id"]:
+            target_info = self.broker.get_order(pos["target_order_id"])
+            if target_info["status"] == "filled":
+                fill_price = target_info["filled_avg_price"] or pos["profit_target"]
+                # Cancel the stop order
+                if pos["stop_order_id"]:
+                    self.broker.cancel_order(pos["stop_order_id"])
+                return "profit_target", fill_price
+
+        return None
 
     def close_trade(self, exit_price):
         """Close the current position and record P&L."""
@@ -112,25 +205,10 @@ class RiskManager:
         self.account_size += pnl
         self.open_position = None
 
+        # Sync with broker for accurate balance
+        self.sync_account()
+
         return trade_record
-
-    def check_exit_conditions(self, current_price):
-        """
-        Check if the current price hits stop loss or profit target.
-
-        Returns:
-            ("stop_loss", price), ("profit_target", price), or None.
-        """
-        if self.open_position is None:
-            return None
-
-        if current_price <= self.open_position["stop_loss"]:
-            return "stop_loss", self.open_position["stop_loss"]
-
-        if current_price >= self.open_position["profit_target"]:
-            return "profit_target", self.open_position["profit_target"]
-
-        return None
 
     def get_status(self):
         """Return current risk manager status."""

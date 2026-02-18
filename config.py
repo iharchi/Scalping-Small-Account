@@ -2,6 +2,13 @@
 Configuration for the Small Account Scalping Pipeline.
 """
 
+import os
+
+# Alpaca API settings (paper trading)
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
+ALPACA_PAPER = True  # True = paper trading, False = live (be careful)
+
 # Account settings
 ACCOUNT_SIZE = 500.00
 MAX_RISK_PER_TRADE_PCT = 1.0  # 1% of account per trade
