@@ -3,8 +3,9 @@
 Small Account Scalping Pipeline — Entry Point.
 
 Usage:
-    python main.py                          # Interactive mode with checklist
-    python main.py --auto                   # Auto mode (skip checklist, for backtesting)
+    python main.py                          # One-shot scan
+    python main.py --loop                   # Live loop (1s cycles)
+    python main.py --loop --auto            # Live loop, skip checklist
     python main.py --symbols AAPL TSLA      # Custom watchlist
     python main.py --account-size 1000      # Custom account size
 
@@ -53,6 +54,11 @@ def parse_args():
         default=None,
         help="Override max trades per day",
     )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run in continuous loop mode with 1-second cycles",
+    )
     return parser.parse_args()
 
 
@@ -73,16 +79,20 @@ def main():
     if args.max_trades is not None:
         pipeline.risk_manager.max_trades = args.max_trades
 
-    opportunities = pipeline.run(args.symbols)
+    if args.loop:
+        pipeline.run_loop(args.symbols)
+        return 0
+    else:
+        opportunities = pipeline.run(args.symbols)
 
-    if opportunities:
-        print("\nRemember:")
-        print("  - Trading in a small account is about PROOF OF CONCEPT")
-        print("  - Be disciplined — take ONE good trade")
-        print("  - Cut losses quickly, let winners run to target")
-        print("  - Trading is a marathon, not a sprint")
+        if opportunities:
+            print("\nRemember:")
+            print("  - Trading in a small account is about PROOF OF CONCEPT")
+            print("  - Be disciplined — take ONE good trade")
+            print("  - Cut losses quickly, let winners run to target")
+            print("  - Trading is a marathon, not a sprint")
 
-    return 0 if opportunities else 1
+        return 0 if opportunities else 1
 
 
 if __name__ == "__main__":

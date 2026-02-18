@@ -29,6 +29,10 @@ OPENING_RANGE_MINUTES = 1
 STOP_LOSS_ATR_MULTIPLIER = 1.5
 PROFIT_TARGET_RATIO = 2.0  # Risk/reward ratio (2:1)
 
+# Loop settings
+CYCLE_INTERVAL = 1.0  # Max seconds per pipeline cycle (must be <= 1.0)
+SCAN_REFRESH_INTERVAL = 300  # Re-run full scanner every 5 minutes
+
 # Data settings
 INTRADAY_INTERVAL = "1m"
 DAILY_INTERVAL = "1d"
